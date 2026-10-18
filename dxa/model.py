@@ -24,6 +24,10 @@ from sklearn.metrics import f1_score
 from .data import LABEL_AXIS, LABEL_FOREIGN, LABEL_POSITIONING, LABEL_ROI
 
 AXIS_LIMIT_DEG = 5.0          # ТЗ
+# Порог оси проверяли обучаемым (коридор 4.0-5.0°): честная CV дала F1 0.370 против 0.364 при
+# пороге ТЗ, но общий F1 просел 0.745 -> 0.739 из-за ложных тревог. Оставлен порог ТЗ:
+# ось ограничена шумом разметки (6/10 нарушений имеют наклон 2-4.6°, 8 норм наклонены > 5°),
+# а не выбором порога. См. REPORT.md, раздел 4.1.
 ILIAC_MIN_FRAC = 0.005        # «гребни не видны»: кости по бокам у нижнего края практически нет
 ROI_BOTTOM_CM = 3.0           # ТЗ
 # ТЗ: по 3 см сверху и снизу от области интереса; стандартная область интереса бедра ~7 см —
@@ -54,11 +58,23 @@ def _best_threshold(y: np.ndarray, score: np.ndarray) -> float:
     return float(cands[int(np.argmax(f1))])
 
 
+def _axis_threshold(y: np.ndarray, angle: np.ndarray) -> float:
+    """Порог наклона оси — значение ТЗ.
+
+    Обучаемый порог проверяли (коридор 4.0-5.0°): выигрыша в честной CV нет, а ложных тревог
+    больше. Разметка врачей расходится с порогом ТЗ в обе стороны, поэтому следуем ТЗ.
+    """
+    return AXIS_LIMIT_DEG
+
+
 class QualityModel:
     def fit(self, feats: list[dict], regions: list[str], labels: list[dict]):
         regions = np.array(regions)
-        # --- позвоночник: посторонние предметы — один порог по обучению
+        # --- позвоночник: порог оси (в коридоре вокруг ТЗ) и посторонние предметы
         sp = np.nonzero(regions == "spine")[0]
+        y_axis = np.array([labels[i].get(LABEL_AXIS, 0) for i in sp])
+        angle = _nan([feats[i].get("axis_chord15_deg", np.nan) for i in sp], 0.0)
+        self.axis_threshold = _axis_threshold(y_axis, angle)
         y_fo = np.array([labels[i].get(LABEL_FOREIGN, 0) for i in sp])
         ridge = _nan([feats[i].get("fo_ridge_p99", np.nan) for i in sp], 0.0)
         self.fo_threshold = _best_threshold(y_fo, ridge)
@@ -82,6 +98,10 @@ class QualityModel:
         self.area_norm = float(np.median(area[y == 0]))
         self.ref_u = np.abs(area - self.area_norm)
         self.ref_off = -off
+        # Третий признак (наклон диафиза rot_shaft_deg) проверяли честной CV + перестановочным тестом:
+        # при пороге max-F1 он поднимал F1 0.669 -> 0.722, но за счёт recall (0.789 -> 0.739),
+        # а при одинаковом recall>=0.85 был ХУЖЕ (F1 0.609 против 0.669). Прирост AUC +0.004 незначим
+        # (p = 0.17). Отклонён: обмен чувствительности на точность не нужен — см. REPORT.md 4.5.
         score = self._femur_score(area, off)
         self.femur_threshold = _best_threshold(y, score)
 
@@ -121,8 +141,10 @@ class QualityModel:
         out = {}
         if region == "spine":
             ang = feat.get("axis_chord15_deg", np.nan)
-            out[LABEL_AXIS] = (int(np.isfinite(ang) and ang > AXIS_LIMIT_DEG), float(_nan([ang], 0)[0]),
-                               f"наклон оси {ang:.1f}° (допуск ТЗ {AXIS_LIMIT_DEG:g}°)")
+            thr_axis = float(getattr(self, "axis_threshold", AXIS_LIMIT_DEG))
+            flag = int(np.isfinite(ang) and ang > thr_axis)
+            out[LABEL_AXIS] = (flag, float(_nan([ang], 0)[0]),
+                               f"наклон оси {ang:.1f}° (порог {thr_axis:.1f}°, допуск ТЗ {AXIS_LIMIT_DEG:g}°)")
             fr = feat.get("sp_iliac_frac", np.nan)
             out[LABEL_POSITIONING] = (int(np.isfinite(fr) and fr < ILIAC_MIN_FRAC), float(-_nan([fr], 0)[0]),
                                       "гребни подвздошных костей не видны у нижнего края" if np.isfinite(fr) and fr < ILIAC_MIN_FRAC

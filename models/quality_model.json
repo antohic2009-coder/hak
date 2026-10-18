@@ -1,9 +1,10 @@
 {
- "trained": "2026-10-17T02:48:33",
+ "trained": "2026-10-18T16:27:55",
  "n_images": 252,
  "n_labeled": 249,
  "fo_threshold": 0.027859590951067468,
  "fo_over_spine_threshold": 0.027420606106020286,
+ "axis_threshold": 5.0,
  "femur_threshold": 0.6016333333333334,
  "area_norm": 1.949685706087115
 }

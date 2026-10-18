@@ -4,7 +4,7 @@
   * UID исследования — имя папки, теги обезличены (BodyPart, Laterality, PixelSpacing пусты);
   * одно изображение хранится в нескольких копиях; число копий — полезный признак;
   * порядок съёмки устойчив: позвоночник имеет InstanceNumber = 1 (91 из 95), дальше бёдра;
-  * область определяется шириной кадра (300 — позвоночник, 280/248 — бедро) и порядком;
+  * область определяется по анатомической форме, а ширина кадра используется как запасное правило;
   * сторона бедра — по наклону оси кости внутри пары (меньший наклон — правое).
 """
 
@@ -20,7 +20,7 @@ import pydicom
 
 warnings.filterwarnings("ignore")
 
-SPINE_MIN_WIDTH = 295
+SPINE_MIN_WIDTH = 290
 # Тега PixelSpacing нет, НО есть (0040,0303) Exposed Area — физический размер снятой области
 # в мм. Он присутствует во всех 499 файлах набора и даёт размер пикселя для каждого снимка:
 # медиана 0.607 × 0.608 мм, то есть пиксель квадратный (а не 0.6 × 1.05, как принято «на глаз»).
@@ -61,6 +61,8 @@ class Image:
 
 def pixel_spacing(ds, array: np.ndarray) -> tuple[float, float]:
     """Размер пикселя из Exposed Area (0040,0303): [ширина, высота] снятой области в мм."""
+    if ds is None:
+        return PIXEL_SPACING_MM
     area = ds.get(EXPOSED_AREA_TAG)
     if area is None or len(area.value) < 2:
         return PIXEL_SPACING_MM
@@ -74,6 +76,31 @@ def pixel_spacing(ds, array: np.ndarray) -> tuple[float, float]:
     if not (0.4 <= sx <= 1.0 and 0.4 <= sy <= 1.0):
         return PIXEL_SPACING_MM
     return sx, sy
+
+
+def anatomy_region(array: np.ndarray, spacing: tuple[float, float]) -> str | None:
+    """Область по форме кости, независимо от размеров матрицы снимка.
+
+    Позвоночник образует узкий почти вертикальный столб, бедро -- широкую диагональную
+    структуру. ``None`` означает, что для этого снимка надёжнее оставить резервное правило.
+    """
+    from . import axis
+
+    # Центр линии нужен только как грубая анатомическая проверка; уменьшение вдвое делает
+    # её в три раза быстрее, не меняя решения на размеченных снимках.
+    step = 2
+    arr = array[::step, ::step]
+    sp = (spacing[0] * step, spacing[1] * step)
+    ys, xs = axis.centerline(arr, sp)
+    if len(ys) < 10:
+        return None
+    span_mm = float((xs.max() - xs.min()) * sp[0])
+    slope = abs(float(np.polyfit(ys, xs, 1)[0])) * sp[0] / max(sp[1], 1e-6)
+    if span_mm < 25.0 and slope < 0.20:
+        return "spine"
+    if span_mm > 45.0 or slope > 0.35:
+        return "femur"
+    return None
 
 
 def read_labels(xlsx_path: str | Path) -> dict[str, dict]:
@@ -155,7 +182,7 @@ def load_dataset(root: str | Path, with_labels: bool = True) -> list[Image]:
         study_images = []
         for group in groups:
             instance, image_uid, array, path, spacing = group[0]
-            region = "spine" if array.shape[1] >= SPINE_MIN_WIDTH else "femur"
+            region = anatomy_region(array, spacing) or ("spine" if array.shape[1] >= SPINE_MIN_WIDTH else "femur")
             study_images.append(Image(study_uid=study_uid, image_uid=image_uid, path=path,
                                       array=array, region=region, side=None, instance=instance,
                                       copies=len(group), n_images=len(groups), spacing=spacing))

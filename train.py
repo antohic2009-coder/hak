@@ -53,6 +53,7 @@ def main():
     model = QualityModel().fit([geo[i] for i in lab], [images[i].region for i in lab], [images[i].labels for i in lab])
     meta = dict(trained=dt.datetime.now().isoformat(timespec="seconds"), n_images=len(images), n_labeled=len(lab),
                 fo_threshold=model.fo_threshold, fo_over_spine_threshold=model.fo_over_spine_threshold,
+                axis_threshold=model.axis_threshold,
                 femur_threshold=model.femur_threshold, area_norm=model.area_norm)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(dict(quality=model, meta=meta), args.out)

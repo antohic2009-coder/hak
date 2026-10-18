@@ -21,7 +21,7 @@ import numpy as np
 import pydicom
 
 from . import features
-from .data import pixel_spacing
+from .data import anatomy_region, pixel_spacing
 
 warnings.filterwarnings("ignore")
 
@@ -31,6 +31,7 @@ SIDE_NAMES = {"l": "левое", "r": "правое"}
 # Область без тегов: у аппарата организатора снимок позвоночника 300 пикселей в ширину, бедра — 248–280
 # (252 из 252 снимков обучения). Порог — середина промежутка.
 SPINE_MIN_WIDTH_PX = 290
+
 
 # подсказки из тегов и имён файлов (в наборе организатора: ПОП, ЛПОБ, ППОБ)
 _SPINE_HINT = re.compile(r"(ПОП|позвон|spine|l1-?l4|lumbar)", re.I)
@@ -117,7 +118,7 @@ def read_items(src) -> list[Item]:
 def _hint(it: Item, pattern: re.Pattern) -> bool:
     ds = it.ds
     text = " ".join(str(ds.get(t, "") or "") for t in ("BodyPartExamined", "SeriesDescription", "ProtocolName",
-                                                          "ImageLaterality", "Laterality", "StudyDescription"))
+                                                          "ImageLaterality", "Laterality", "StudyDescription")) if ds is not None else ""
     return bool(pattern.search(text) or pattern.search(Path(it.path).name))
 
 
@@ -129,11 +130,27 @@ class Service:
 
     # --- область и сторона
     @staticmethod
-    def _region(it: Item) -> str:
+    def _region_with_source(it: Item) -> tuple[str, str]:
         spine_hint, femur_hint = _hint(it, _SPINE_HINT), _hint(it, _FEMUR_HINT)
         if spine_hint != femur_hint:
-            return "spine" if spine_hint else "femur"
-        return "spine" if it.array.shape[1] >= SPINE_MIN_WIDTH_PX else "femur"
+            return ("spine" if spine_hint else "femur"), "теги/имя файла"
+        # анатомия важнее ширины кадра: правило по ширине настроено под конкретный аппарат,
+        # а форма столба/диафиза — нет (защита от смены аппарата на закрытом тесте)
+        spacing = it.result.get("spacing") or pixel_spacing(it.ds, it.array)
+        anat = anatomy_region(it.array, spacing)
+        if anat:
+            return anat, "анатомия (форма структуры)"
+        return ("spine" if it.array.shape[1] >= SPINE_MIN_WIDTH_PX else "femur"), \
+            f"ширина кадра {it.array.shape[1]} px"
+
+    @staticmethod
+    def _region(it: Item) -> str:
+        return Service._region_with_source(it)[0]
+
+    @staticmethod
+    def _region_source(it: Item) -> str:
+        """Откуда взята область — для прозрачности в details."""
+        return Service._region_with_source(it)[1]
 
     @staticmethod
     def _anatomical_side(it: Item) -> str:
@@ -195,12 +212,12 @@ class Service:
 
     def _process_image(self, it: Item):
         spacing = pixel_spacing(it.ds, it.array)
-        it.region = self._region(it)
+        it.result["spacing"] = spacing
+        it.region, it.result["region_source"] = self._region_with_source(it)
         if it.region == "femur":
             it.side, it.result["side_source"] = self._side(it)
         feats = features.geometry(it.array, spacing, it.region, it.side)
         it.result["features"] = feats
-        it.result["spacing"] = spacing
         it.result["criteria"] = self.model.predict(feats, it.region)
         it.result["probs"], it.result["quality_prob"] = self.model.probabilities(it.result["criteria"], it.region)
 
@@ -223,8 +240,10 @@ class Service:
             "violation_type": "; ".join(violations) if not it.error else "",
             "processing_status": "Failure" if it.error else "Success",
             "time_of_processing": round(elapsed, 3),
-            "details": " | ".join(f"{name}: {text} (вероятность {it.result.get('probs', {}).get(name, 0):.2f})"
-                                  for name, (_, _, text) in crit.items()),
+            "details": " | ".join(
+                ([f"область определена: {it.result['region_source']}"] if it.result.get("region_source") else [])
+                + [f"{name}: {text} (вероятность {it.result.get('probs', {}).get(name, 0):.2f})"
+                   for name, (_, _, text) in crit.items()]),
             "duplicate_of": it.duplicate_of or "",
             "error": it.error or "",
         }

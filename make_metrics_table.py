@@ -30,6 +30,16 @@ rows = []
 for name, v in report.items():
     if not isinstance(v, dict):
         continue
+    if name == "quality_prob operating points":
+        for point, p in v.items():
+            note = f"порог {p['threshold']:.3f}; precision {p['precision']:.2f}"
+            if point == "recall_target_0.90":
+                note += "; целевой recall 0.90"
+            rows.append([f"quality_prob: {point}", "", p.get("predicted_positive", ""),
+                         f"{p['auc']:.3f} {ci(p, 'auc')}", f"{p['f1']:.3f} {ci(p, 'f1')}",
+                         f"{p['sens']:.2f}", f"{p['spec']:.2f}",
+                         note])
+        continue
     if name.startswith("quality_prob"):
         rows.append([name, "", "", f"{v['auc']:.3f} {ci(v, 'auc')}", "", "", "",
                      f"средняя вероятность {v['mean_prob']:.2f} при доле брака {v['rate']:.2f}"])
