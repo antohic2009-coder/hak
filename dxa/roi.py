@@ -132,6 +132,13 @@ def landmarks(array: np.ndarray, spacing: Spacing, side: str | None = None) -> d
         protrusion = (edge - shaft_edge) * sign * sx  # мм медиальнее линии диафиза
         protrusion = ndimage.median_filter(protrusion, 5)
         peak = int(np.argmax(protrusion))
+        # анатомическая защита: вершина малого вертела лежит в 1.2–3.2 радиуса головки ниже
+        # её центра; ниже — седалищная кость, на которую медиальный контур может «перепрыгнуть»
+        # и увести вершину вниз (тогда lt_bottom занижает отступ до края и портит решение по ТЗ)
+        rel = (np.asarray(band, float) - hy) / radius
+        ok = np.nonzero((rel >= 1.2) & (rel <= 3.2))[0]
+        if len(ok):
+            peak = int(ok[int(np.argmax(protrusion[ok]))])
         lt_peak = (float(edge[peak]), float(band[peak]))
         after = np.nonzero(protrusion[peak:] < max(3.0, protrusion[peak] * 0.2))[0]
         lt_bottom = float(band[peak + int(after[0])] if len(after) else band[-1])

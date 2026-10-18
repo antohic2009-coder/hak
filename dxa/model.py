@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import numpy as np
+from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+from sklearn.model_selection import StratifiedGroupKFold
 
 from .data import LABEL_AXIS, LABEL_FOREIGN, LABEL_POSITIONING, LABEL_ROI
 
@@ -67,8 +69,66 @@ def _axis_threshold(y: np.ndarray, angle: np.ndarray) -> float:
     return AXIS_LIMIT_DEG
 
 
+class FemurScorer:
+    """Скоринг ротации бедра по двум измерениям: выступ малого вертела и офсет головки.
+
+    * ``cdf`` — как раньше: |отклонение площади выступа| и -офсет относительно эталонных
+      распределений нормы, среднее двух процентилей;
+    * ``lr`` — логистическая регрессия на тех же двух признаках: вес 50/50 больше не
+      фиксирован вручную, а подбирается по обучающей части (150 строк, 2 признака).
+
+    У обеих версий_score выше — вероятнее нарушение («норма» — низкие значения).
+    """
+
+    def __init__(self, mode: str = "cdf"):
+        self.mode = mode
+
+    def fit(self, area_raw: np.ndarray, off_raw: np.ndarray, y: np.ndarray) -> "FemurScorer":
+        self.area_fill, self.off_fill = float(np.nanmedian(area_raw)), float(np.nanmedian(off_raw))
+        area = np.log1p(np.clip(_nan(area_raw, self.area_fill), 0, None))
+        off = _nan(off_raw, self.off_fill)
+        # площадь выступа — величина «во сколько раз»: гладкий контур 1 мм² и норма 6 мм² отличаются
+        # так же сильно, как крупный вертел 36 мм²; в линейной шкале переротация недооценивалась
+        self.area_norm = float(np.median(area[y == 0]))
+        self.ref_u = np.abs(area - self.area_norm)
+        self.ref_off = -off
+        self.lr = None
+        if self.mode == "lr" and 0 < y.sum() < len(y):
+            dev, z = np.abs(area - self.area_norm), -off
+            self.feat_mu = np.array([dev.mean(), z.mean()])
+            self.feat_sd = np.array([dev.std() + 1e-9, z.std() + 1e-9])
+            X = self._features(dev, z)
+            self.lr = LogisticRegression(C=1.0).fit(X, y)
+        self.threshold = _best_threshold(y, self.score(area_raw, off_raw))
+        return self
+
+    def _features(self, dev: np.ndarray, z: np.ndarray) -> np.ndarray:
+        return np.column_stack([(dev - self.feat_mu[0]) / self.feat_sd[0],
+                                (z - self.feat_mu[1]) / self.feat_sd[1]])
+
+    def score(self, area_raw: np.ndarray, off_raw: np.ndarray) -> np.ndarray:
+        area = np.log1p(np.clip(_nan(area_raw, self.area_fill), 0, None))
+        off = _nan(off_raw, self.off_fill)
+        if self.lr is not None:
+            dev, z = np.abs(area - self.area_norm), -off
+            return self.lr.predict_proba(self._features(dev, z))[:, 1]
+        return (_cdf(self.ref_u, np.abs(area - self.area_norm)) + _cdf(self.ref_off, -off)) / 2
+
+
 class QualityModel:
-    def fit(self, feats: list[dict], regions: list[str], labels: list[dict]):
+    # Рабочая конфигурация выбрана честной CV (experiments/ab_improve.py, out/ab_improve.json):
+    # * скоринг ротации — эталонные CDF; логрегрессия на тех же двух признаках поднимает AUC
+    #   только на +0.011 (p = 0.199, перестановочный тест) и роняет флаговый F1 0.698 -> 0.644 —
+    #   отвергнута;
+    # * калибровка вероятностей — изотоническая, для скоринга ротации калибратор учится на его
+    #   out-of-fold оценках (потому что сам скор настроен по меткам): quality_prob AUC 0.834 -> 0.855,
+    #   F1 на пороге 0.5: 0.518 -> 0.685 (recall 0.40 -> 0.67); F1 и специфичность флаговых
+    #   режимов остаются прежними (калибровка в них не участвует).
+    femur_score_mode = "cdf"    # "cdf" (принято) | "lr" (проверено, отвергнуто)
+    calib_mode = "oof"          # "oof" (принято) | "in_sample" (прежнее поведение)
+    calib_kind = "isotonic"     # "isotonic" (принято) | "lr" (проверено: избыточно сглаживает)
+
+    def fit(self, feats: list[dict], regions: list[str], labels: list[dict], groups=None):
         regions = np.array(regions)
         # --- позвоночник: порог оси (в коридоре вокруг ТЗ) и посторонние предметы
         sp = np.nonzero(regions == "spine")[0]
@@ -88,24 +148,20 @@ class QualityModel:
         # --- бедро: укладка/ротация — две оценки
         fe = np.nonzero(regions == "femur")[0]
         y = np.array([labels[i].get(LABEL_POSITIONING, 0) for i in fe])
-        area = np.array([feats[i].get("rot_lt_area_mm2", np.nan) for i in fe], float)
-        off = np.array([feats[i].get("rot_offset_mm", np.nan) for i in fe], float)
-        self.area_fill, self.off_fill = float(np.nanmedian(area)), float(np.nanmedian(off))
-        area, off = _nan(area, self.area_fill), _nan(off, self.off_fill)
-        # площадь выступа — величина «во сколько раз»: гладкий контур 1 мм² и норма 6 мм² отличаются
-        # так же сильно, как крупный вертел 36 мм²; в линейной шкале переротация недооценивалась
-        area = np.log1p(np.clip(area, 0, None))
-        self.area_norm = float(np.median(area[y == 0]))
-        self.ref_u = np.abs(area - self.area_norm)
-        self.ref_off = -off
+        area_raw = np.array([feats[i].get("rot_lt_area_mm2", np.nan) for i in fe], float)
+        off_raw = np.array([feats[i].get("rot_offset_mm", np.nan) for i in fe], float)
         # Третий признак (наклон диафиза rot_shaft_deg) проверяли честной CV + перестановочным тестом:
         # при пороге max-F1 он поднимал F1 0.669 -> 0.722, но за счёт recall (0.789 -> 0.739),
         # а при одинаковом recall>=0.85 был ХУЖЕ (F1 0.609 против 0.669). Прирост AUC +0.004 незначим
         # (p = 0.17). Отклонён: обмен чувствительности на точность не нужен — см. REPORT.md 4.5.
-        score = self._femur_score(area, off)
-        self.femur_threshold = _best_threshold(y, score)
+        self.femur = FemurScorer(self.femur_score_mode).fit(area_raw, off_raw, y)
+        self.femur_threshold = self.femur.threshold
 
-        # --- калибровка: оценка каждого критерия -> вероятность нарушения (для quality_prob)
+        # --- калибровка: оценка каждого критерия -> вероятность нарушения (для quality_prob).
+        # Оценки позвоночника и ROI бедра — чистые измерения (не зависят от порогов, обученных
+        # по меткам), калибратор учится на них штатно. Оценка ротации бедра настроена по меткам,
+        # поэтому в режиме "oof" калибратор видит её out-of-fold значения (внутренняя CV по
+        # исследованиям — как во внешней), а не подгонку на собственных ответах модели.
         self.calib = {}
         spine_out = [self.predict(feats[i], "spine") for i in sp]
         for L in (LABEL_AXIS, LABEL_POSITIONING, LABEL_FOREIGN):
@@ -114,27 +170,70 @@ class QualityModel:
         roi_idx = [i for i in fe if LABEL_ROI in labels[i]]
         self._fit_calib(("femur", LABEL_ROI), [self.predict(feats[i], "femur")[LABEL_ROI][1] for i in roi_idx],
                         [labels[i][LABEL_ROI] for i in roi_idx])
-        self._fit_calib(("femur", LABEL_POSITIONING), score, y)
+        femur_scores = self.femur.score(area_raw, off_raw)
+        if self.calib_mode == "oof" and groups is not None and 0 < y.sum() < len(y):
+            oof = self._oof_femur_scores(feats, fe, y, groups)
+            if oof is not None and np.isfinite(oof).all():
+                femur_scores = oof
+        self._fit_calib(("femur", LABEL_POSITIONING), femur_scores, y)
         return self
 
+    def _oof_femur_scores(self, feats, fe, y, groups, folds: int = 3):
+        """Out-of-fold оценки ротации: параметры скоринга (эталоны, LR) переучиваются на
+        внутренних фолдах, чтобы калибратор не видел собственные ответы модели."""
+        area = np.array([feats[i].get("rot_lt_area_mm2", np.nan) for i in fe], float)
+        off = np.array([feats[i].get("rot_offset_mm", np.nan) for i in fe], float)
+        pred = np.full(len(y), np.nan)
+        try:
+            cv = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=0)
+            for tr, te in cv.split(np.zeros(len(y)), y, groups):
+                if 0 < y[tr].sum() < len(tr):
+                    scorer = FemurScorer(self.femur_score_mode).fit(area[tr], off[tr], y[tr])
+                    pred[te] = scorer.score(area[te], off[te])
+        except Exception:
+            return None
+        return pred if np.isfinite(pred).all() else None
+
     def _fit_calib(self, key, score, y):
-        s = np.asarray(score, float)
-        y = np.asarray(y, int)
+        """Калибратор критерия: изотоническая регрессия или логрегрессия на (оценка, метка).
+
+        В режиме oof скор ротации бедра уже подан как out-of-fold (см. уровнем выше) — он
+        настроен по меткам. Для критериев с чистыми измерениями (позвоночник, ROI) OOF
+        ответов калибратора проверяли и отвергли: при 6-7 плюсы на внутренний фолд изотоника
+        подгоняет мусорные ступеньки и калибровка вероятностей ломается (out/ab_improve.json).
+        """
+        s, y = np.asarray(score, float), np.asarray(y, int)
+        if self.calib_kind == "isotonic" and 0 < y.sum() < len(y):
+            iso = IsotonicRegression(out_of_bounds="clip").fit(s, y)
+            self.calib[key] = ("iso", iso, float(y.mean()))
+            return
         mu, sd = float(s.mean()), float(s.std() + 1e-9)
         lr = LogisticRegression(C=1.0).fit(((s - mu) / sd)[:, None], y) if 0 < y.sum() < len(y) else None
-        self.calib[key] = (mu, sd, lr, float(y.mean()))
+        self.calib[key] = ("lr", mu, sd, lr, float(y.mean()))
+
+    @property
+    def area_norm(self) -> float:
+        return self.femur.area_norm
+
+    @property
+    def area_fill(self) -> float:
+        return self.femur.area_fill
+
+    @property
+    def off_fill(self) -> float:
+        return self.femur.off_fill
 
     def probabilities(self, out: dict, region: str) -> tuple[dict, float]:
         """Вероятность нарушения по каждому критерию и итоговая quality_prob = P(хотя бы одно нарушение)."""
         probs = {}
         for L, (_, score, _) in out.items():
-            mu, sd, lr, base = self.calib.get((region, L), (0.0, 1.0, None, 0.0))
-            probs[L] = float(lr.predict_proba([[(score - mu) / sd]])[0, 1]) if lr is not None else base
+            c = self.calib.get((region, L), ("lr", 0.0, 1.0, None, 0.0))
+            if c[0] == "iso":
+                probs[L] = float(c[1].predict([score])[0])
+            else:
+                _, mu, sd, lr, base = c
+                probs[L] = float(lr.predict_proba([[(score - mu) / sd]])[0, 1]) if lr is not None else base
         return probs, float(1 - np.prod([1 - p for p in probs.values()]))
-
-    def _femur_score(self, area, off):
-        u = np.abs(area - self.area_norm)
-        return (_cdf(self.ref_u, u) + _cdf(self.ref_off, -off)) / 2
 
     def predict(self, feat: dict, region: str) -> dict:
         """{метка: (флаг 0/1, оценка, объяснение)} по критериям области."""
@@ -177,16 +276,16 @@ class QualityModel:
                               + ("; скан слишком короткий — бедро не помещается" if short_field else "")
                               + ("; ориентиры ненадёжны — решение только по длине скана" if not rel else ""))
             area_mm2 = float(_nan([feat.get("rot_lt_area_mm2", np.nan)], self.area_fill)[0])
-            area = float(np.log1p(max(area_mm2, 0.0)))
             off = float(_nan([feat.get("rot_offset_mm", np.nan)], self.off_fill)[0])
-            s = float(self._femur_score(np.array([area]), np.array([off]))[0])
-            kind = "переротация (контур гладкий)" if area < self.area_norm else "недоротация (малый вертел крупный)"
+            s = float(self.femur.score(np.array([area_mm2]), np.array([off]))[0])
+            kind = "переротация (контур гладкий)" if float(np.log1p(max(area_mm2, 0.0))) < self.femur.area_norm \
+                else "недоротация (малый вертел крупный)"
             isch = feat.get("femur_ischium_frac", np.nan)
             no_ischium = bool(np.isfinite(isch) and isch < ISCHIUM_MIN_FRAC)
             rotated = s >= self.femur_threshold
             out[LABEL_POSITIONING] = (int(rotated or no_ischium), s,
-                                      f"малый вертел {area_mm2:.0f} мм² (норма ~{np.expm1(self.area_norm):.0f}), офсет головки {off:.0f} мм; "
-                                      f"оценка ротации {s:.2f} (порог {self.femur_threshold:.2f})"
+                                      f"малый вертел {area_mm2:.0f} мм² (норма ~{np.expm1(self.femur.area_norm):.0f}), офсет головки {off:.0f} мм; "
+                                      f"оценка ротации {s:.2f} (порог {self.femur.threshold:.2f})"
                                       + (f"; вероятно {kind}" if rotated else "")
                                       + ("; седалищная кость не попала в кадр" if no_ischium else ""))
         return out

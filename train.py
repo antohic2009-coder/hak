@@ -50,7 +50,8 @@ def main():
     pickle.dump(cache, open(args.cache, "wb"))
 
     lab = [i for i, im in enumerate(images) if im.quality is not None]
-    model = QualityModel().fit([geo[i] for i in lab], [images[i].region for i in lab], [images[i].labels for i in lab])
+    model = QualityModel().fit([geo[i] for i in lab], [images[i].region for i in lab], [images[i].labels for i in lab],
+                               groups=[images[i].study_uid for i in lab])
     meta = dict(trained=dt.datetime.now().isoformat(timespec="seconds"), n_images=len(images), n_labeled=len(lab),
                 fo_threshold=model.fo_threshold, fo_over_spine_threshold=model.fo_over_spine_threshold,
                 axis_threshold=model.axis_threshold,

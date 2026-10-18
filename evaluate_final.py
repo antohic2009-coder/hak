@@ -71,7 +71,8 @@ def operating_threshold(y, score, target_recall=None):
 
 for seed in range(SEEDS):
     for tr, te in StratifiedGroupKFold(FOLDS, shuffle=True, random_state=seed).split(np.zeros(len(images)), y_any, groups):
-        m = QualityModel().fit([feats[i] for i in tr], [regions[i] for i in tr], [labels[i] for i in tr])
+        m = QualityModel().fit([feats[i] for i in tr], [regions[i] for i in tr], [labels[i] for i in tr],
+                               groups=groups[tr])
         train_qprob = np.array([m.probabilities(m.predict(feats[i], regions[i]), regions[i])[1] for i in tr])
         thresholds = {
             "threshold_0.50": 0.5,
