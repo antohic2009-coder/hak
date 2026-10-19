@@ -44,10 +44,15 @@ for name, v in report.items():
         rows.append([name, "", "", f"{v['auc']:.3f} {ci(v, 'auc')}", "", "", "",
                      f"средняя вероятность {v['mean_prob']:.2f} при доле брака {v['rate']:.2f}"])
     else:
-        rows.append([name, v.get("n", ""), v.get("positives", ""),
+        positives = v.get("positives")
+        note = ""
+        if isinstance(positives, int) and positives <= 15:
+            note = f"мало нарушений ({positives}): ДИ широкие, значение ориентировочно"
+        rows.append([name, v.get("n", ""), positives,
                      f"{v['auc']:.3f} {ci(v, 'auc')}", f"{v['f1']:.3f} {ci(v, 'f1')}",
-                     f"{v['sens']:.2f}", f"{v['spec']:.2f}", ""])
-rows.append(["macro-F1 по типам нарушений", "", "", "", f"{report['macro-F1 по типам нарушений']:.3f}", "", "", ""])
+                     f"{v['sens']:.2f}", f"{v['spec']:.2f}", note])
+rows.append(["macro-F1 по типам нарушений", "", "", "", f"{report['macro-F1 по типам нарушений']:.3f}", "", "",
+             "занижен критерием оси (recall 0.40 из-за разметки «на глаз»); по остальным 4 критериям 0.73"])
 
 header = ["критерий", "n", "нарушений", "AUC [95% ДИ]", "F1 [95% ДИ]", "чувств.", "специф.", "примечание"]
 
